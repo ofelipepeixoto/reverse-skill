@@ -347,8 +347,8 @@ verify_sha256() {
   elif command -v shasum >/dev/null 2>&1; then
     actual=$(shasum -a 256 "$file" | awk '{print tolower($1)}')
   else
-    log_warn "sha256 tool missing; skip integrity for $file"
-    return 0
+    log_err "sha256 tool missing; refusing unverified artifact"
+    return 1
   fi
   local exp="$expected"
   if [[ -z "$exp" && -n "$api_digest" ]]; then
@@ -364,7 +364,8 @@ verify_sha256() {
     fi
     log_ok "SHA256 OK: $actual"
   else
-    log_warn "No pinned digest for $(basename "$file"); recorded sha256=$actual"
+    log_err "No trusted SHA256 digest; refusing unverified artifact"
+    return 1
   fi
 }
 

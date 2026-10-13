@@ -64,6 +64,15 @@ jobs:
         shell: powershell
         run: ./skills/scripts/test-bootstrap-codex-encoding.ps1
 
+      - name: Synthetic consolidation and scanner safety
+        shell: pwsh
+        run: ./skills/scripts/test-audit-safety.ps1
+
+      - name: Synthetic safety (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./skills/scripts/test-audit-safety.ps1
+
       - name: Evidence consolidation py/ps1 parity (Windows PowerShell 5.1)
         if: runner.os == 'Windows'
         shell: powershell
@@ -371,3 +380,26 @@ jobs:
             exit 1
           }
           Write-Host "Version OK: $v"
+
+  safety-regressions:
+    name: synthetic safety boundaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fail-closed artifact integrity regression
+        run: bash skills/scripts/test-bootstrap-integrity.sh
+      - name: Memory-only evidence containment regressions
+        run: python3 skills/scripts/test-consolidate-security.py
+      - name: Mocked bridge transport regressions
+        run: node burp-mcp-full/test/safety-boundaries.test.js
+      - name: Compile Burp adapter and run synthetic Java policy regressions
+        working-directory: burp-mcp-full
+        shell: bash
+        run: |
+          export JAVA_HOME="$JAVA_HOME_21_X64"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          bash ./gradlew --no-daemon safetyRegression

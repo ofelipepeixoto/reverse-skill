@@ -16,7 +16,6 @@
  */
 
 const http = require('http');
-const readline = require('readline');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -39,25 +38,74 @@ const AUTH_HEADERS = BURP_TOKEN ? { 'Authorization': `Bearer ${BURP_TOKEN}` } : 
 let TOOLS = null;
 let toolsRequest = null;
 
-async function fetchTools() {
+const MAX_BYTES = 1024 * 1024;
+const REQUEST_DEADLINE_MS = 30000;
+const MAX_PENDING = 8;
+
+// Bounded transport, with a total deadline (not only a socket inactivity timer).
+// A timeout after POST may mean the operation happened; never retry it here.
+function requestJson(method, requestPath, payload) {
+  const body = payload === undefined ? null : JSON.stringify(payload);
+  if (body !== null && Buffer.byteLength(body) > MAX_BYTES) {
+    return Promise.reject(new Error('Request exceeds byte limit'));
+  }
   return new Promise((resolve, reject) => {
-    const req = http.request({
-      hostname: BURP_HOST, port: BURP_PORT, path: '/tools', method: 'GET',
-      headers: AUTH_HEADERS
-    }, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-          reject(new Error(`Cannot fetch tools: HTTP ${res.statusCode} ${data.slice(0, 200)}`));
-          return;
+    let settled = false;
+    let req;
+    let response;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      if (error) {
+        reject(error);
+        if (response) response.destroy();
+        if (req) req.destroy();
+      } else resolve(value);
+    };
+    const deadline = setTimeout(() => finish(new Error(
+      'Burp MCP deadline exceeded; operation outcome may be unknown. Do not automatically retry.'
+    )), REQUEST_DEADLINE_MS);
+    try {
+      req = http.request({
+        hostname: BURP_HOST, port: BURP_PORT, path: requestPath, method,
+        headers: body === null ? AUTH_HEADERS : {
+          ...AUTH_HEADERS, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body)
         }
-        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+      }, res => {
+        response = res;
+        let bytes = 0;
+        const chunks = [];
+        res.on('data', chunk => {
+          if (settled) return;
+          const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          bytes += part.length;
+          if (bytes > MAX_BYTES) { finish(new Error('Burp MCP response exceeds byte limit')); return; }
+          chunks.push(part);
+        });
+        res.on('error', () => finish(new Error('Burp MCP response interrupted; outcome may be unknown')));
+        res.on('aborted', () => finish(new Error('Burp MCP response aborted; outcome may be unknown')));
+        res.on('end', () => {
+          if (settled) return;
+          if (res.statusCode !== 200) {
+            finish(new Error(`Burp MCP HTTP ${res.statusCode}; response body omitted`)); return;
+          }
+          try { finish(null, JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+          catch (error) { finish(new Error('Burp MCP returned invalid JSON; response body omitted')); }
+        });
       });
-    });
-    req.on('error', reject);
-    req.end();
+      req.on('error', () => finish(new Error('Burp MCP transport failed; operation outcome may be unknown')));
+      req.end(body);
+    } catch (error) { finish(new Error('Burp MCP transport setup failed')); }
   });
+}
+
+async function fetchTools() {
+  const tools = await requestJson('GET', '/tools');
+  if (!Array.isArray(tools) || tools.length > 256 || tools.some(
+    name => typeof name !== 'string' || !/^[a-z][a-z0-9_]{0,99}$/.test(name)
+  )) throw new Error('Invalid Burp MCP tool list');
+  return tools;
 }
 
 function disconnectedResponse(id) {
@@ -88,32 +136,7 @@ async function ensureTools() {
 }
 
 async function callTool(toolName, params) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ tool: toolName, params: params || {} });
-    const req = http.request({
-      hostname: BURP_HOST, port: BURP_PORT, path: '/', method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), ...AUTH_HEADERS }
-    }, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        if (res.statusCode === 403) {
-          reject(new Error('Burp MCP rejected the request: missing or invalid BURP_MCP_TOKEN. Set BURP_MCP_TOKEN to match the token in ~/.burp-mcp-token.'));
-          return;
-        }
-        try { resolve(JSON.parse(data)); } catch (e) { resolve({ error: data }); }
-      });
-    });
-    req.on('error', (err) => {
-      reject(new Error(
-        `Cannot reach Burp MCP at ${BURP_HOST}:${BURP_PORT} (${err.code || err.message}). ` +
-        `Ensure Burp Suite is running with the "MCP Full Control" extension loaded. ` +
-        `If the port differs, set BURP_MCP_PORT and -Dburp.mcp.port=<same> on Burp.`
-      ));
-    });
-    req.write(body);
-    req.end();
-  });
+  return requestJson('POST', '/', { tool: toolName, params: params || {} });
 }
 
 function buildToolDefinitions(toolNames) {
@@ -288,6 +311,9 @@ function getToolParams(name) {
 }
 
 async function handleRequest(msg) {
+  if (!msg || Array.isArray(msg) || typeof msg !== 'object' || msg.jsonrpc !== '2.0') {
+    return { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } };
+  }
   const { method, id, params } = msg;
 
   switch (method) {
@@ -319,10 +345,16 @@ async function handleRequest(msg) {
         return { jsonrpc: '2.0', id, error: { code: -32602, message: 'tools/call requires params.name' } };
       }
       const toolName = params.name.replace(/^burp_/, '');
-      const toolArgs = params.arguments || {};
+      if (!params.name.startsWith('burp_') || !TOOLS.includes(toolName)) {
+        return { jsonrpc: '2.0', id, error: { code: -32602, message: 'Unknown tool name' } };
+      }
+      const toolArgs = params.arguments === undefined ? {} : params.arguments;
+      if (!toolArgs || Array.isArray(toolArgs) || typeof toolArgs !== 'object') {
+        return { jsonrpc: '2.0', id, error: { code: -32602, message: 'Tool arguments must be an object' } };
+      }
       try {
         const result = await callTool(toolName, toolArgs);
-        return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] } };
+        return { jsonrpc: '2.0', id, result: { isError: !!(result && result.error), content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] } };
       } catch (err) {
         TOOLS = null;
         return { jsonrpc: '2.0', id, error: { code: -1, message: err.message || 'Tool call failed' } };
@@ -334,46 +366,50 @@ async function handleRequest(msg) {
   }
 }
 
-// Main stdio loop
+// Bound the raw line buffer before JSON parsing, including inputs without a newline.
 async function main() {
-  try {
-    await ensureTools();
-  } catch (e) {
-    process.stderr.write(`[burp-mcp-bridge] WARNING: Cannot connect to Burp at ${BURP_HOST}:${BURP_PORT}. Start Burp first.\n`);
-  }
-
-  const rl = readline.createInterface({ input: process.stdin, terminal: false });
+  ensureTools().catch(() => process.stderr.write('[burp-mcp-bridge] Not connected; retry discovery on demand.\n'));
   let pending = 0;
   let stdinClosed = false;
-
-  rl.on('line', (line) => {
-    if (!line.trim()) return;
+  let buffer = Buffer.alloc(0);
+  const send = response => { if (response) process.stdout.write(JSON.stringify(response) + '\n'); };
+  const line = bytes => {
+    if (!bytes.toString('utf8').trim()) return;
     let msg;
-    try {
-      msg = JSON.parse(line);
-    } catch (e) {
-      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }) + '\n');
-      return;
+    try { msg = JSON.parse(bytes.toString('utf8')); }
+    catch (error) { send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }); return; }
+    if (pending >= MAX_PENDING) {
+      send({ jsonrpc: '2.0', id: msg && msg.id !== undefined ? msg.id : null,
+        error: { code: -32000, message: 'Too many pending requests' } }); return;
     }
-
     pending++;
-    handleRequest(msg)
-      .then(response => {
-        if (response) process.stdout.write(JSON.stringify(response) + '\n');
-      })
-      .catch(err => {
-        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id ?? null, error: { code: -1, message: err.message || 'Handler error' } }) + '\n');
-      })
-      .finally(() => {
-        pending--;
-        if (stdinClosed && pending === 0) process.exit(0);
-      });
+    handleRequest(msg).then(send).catch(() => send({ jsonrpc: '2.0', id: msg && msg.id !== undefined ? msg.id : null,
+      error: { code: -32603, message: 'Handler error' } })).finally(() => {
+      pending--;
+      if (stdinClosed && pending === 0) process.exit(process.exitCode || 0);
+    });
+  };
+  process.stdin.on('data', chunk => {
+    // Process individual segments so a chunk containing many small lines is valid.
+    let start = 0;
+    for (let i = 0; i <= chunk.length; i++) {
+      if (i !== chunk.length && chunk[i] !== 10) continue;
+      const segment = chunk.subarray(start, i);
+      if (buffer.length + segment.length > MAX_BYTES) {
+        send({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Input line exceeds byte limit' } });
+        process.stdin.destroy(); process.exitCode = 1; return;
+      }
+      buffer = Buffer.concat([buffer, segment]);
+      if (i < chunk.length) { line(buffer); buffer = Buffer.alloc(0); }
+      start = i + 1;
+    }
   });
-
-  rl.on('close', () => {
+  process.stdin.on('end', () => {
+    if (buffer.length) line(buffer);
     stdinClosed = true;
-    if (pending === 0) process.exit(0);
+    if (pending === 0) process.exit(process.exitCode || 0);
   });
 }
 
-main();
+if (require.main === module) main();
+module.exports = { requestJson, fetchTools, handleRequest, main, MAX_BYTES, MAX_PENDING };

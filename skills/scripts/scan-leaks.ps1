@@ -59,7 +59,7 @@ if (Test-Path $Path -PathType Container) {
 
 $findings = 0
 foreach ($t in $targets) {
-  $lines = Get-Content -Path $t.FullName -Encoding UTF8
+  $lines = @(Get-Content -Path $t.FullName -Encoding UTF8)
   for ($i = 0; $i -lt $lines.Count; $i++) {
     $line = $lines[$i]
     foreach ($p in $patterns) {
@@ -67,7 +67,7 @@ foreach ($t in $targets) {
         if ($p.Name -eq 'Email' -and (Test-EmailAllowed $m.Value)) { continue }
         $findings++
         $kind = if ($ReportOnly) { 'warning' } else { 'error' }
-        Write-Host "::$kind file=$($t.FullName),line=$($i + 1)::$($p.Name): $($m.Value -replace "\r","%0D" -replace "\n","%0A")"
+        Write-Host "::$kind file=$($t.FullName),line=$($i + 1)::$($p.Name): [REDACTED]"
       }
     }
   }

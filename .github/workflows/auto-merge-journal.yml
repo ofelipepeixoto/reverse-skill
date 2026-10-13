@@ -1,4 +1,4 @@
-name: Auto-merge field-journal PRs
+name: Validate field-journal PRs
 
 on:
   pull_request:
@@ -7,11 +7,11 @@ on:
       - 'skills/field-journal/**'
 
 jobs:
-  validate-and-merge:
+  validate-journal:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
+      pull-requests: read
     env:
       PR_NUMBER: ${{ github.event.pull_request.number }}
       PR_TITLE: ${{ github.event.pull_request.title }}
@@ -146,27 +146,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Auto-merge if valid
+      - name: Require human review
         if: steps.validate.outputs.valid == 'true'
-        run: |
-          gh pr merge "$PR_NUMBER" \
-            --auto --squash \
-            --subject "$PR_SUBJECT"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Comment on failure
-        if: steps.validate.outputs.valid == 'false'
-        run: |
-          gh pr comment "$PR_NUMBER" \
-            --body "❌ **自动审核未通过**
-
-          本 PR 未通过安全检查，无法自动合并。可能的原因：
-          - 修改了 field-journal 以外的文件
-          - 内容包含可疑的 prompt injection 特征
-          - 内容包含未脱敏的 API key/token
-          - 单个文件超过 50KB
-
-          请检查并修正后重新提交。"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "Structural checks passed. Human review is required; no automatic merge."

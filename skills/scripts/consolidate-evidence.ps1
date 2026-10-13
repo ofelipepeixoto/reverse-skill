@@ -7,7 +7,7 @@ param(
     [Parameter(Mandatory = $true)][string] $Title,
     [Parameter(Mandatory = $true)][string] $Description,
     [string] $Severity = 'medium',
-    [string] $Status = 'validated',
+    [string] $Status = 'candidate',
     [string] $Confidence = 'medium',
     [string] $Location = 'see evidence_ids'
 )
@@ -17,15 +17,39 @@ if (-not (Test-Path -LiteralPath $CaseRoot)) { Write-Error "CaseRoot not found: 
 
 $evidenceDir = Join-Path $CaseRoot "evidence"
 $reportDir = Join-Path $CaseRoot "report"
-if (-not (Test-Path -LiteralPath $reportDir)) { New-Item -ItemType Directory -Path $reportDir -Force | Out-Null }
+
 
 $idList = @($EvidenceIds -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 if ($idList.Count -eq 0) { Write-Error "No Evidence IDs provided." }
+if (($idList | Select-Object -Unique).Count -ne $idList.Count) { throw "Duplicate Evidence IDs" }
+foreach ($id in $idList) {
+    if ($id -cnotmatch '\AE-[A-Za-z0-9][A-Za-z0-9_-]*\z') { throw "Invalid Evidence ID" }
+}
+if ($FindingId -cnotmatch '\AF-[A-Za-z0-9][A-Za-z0-9_-]*\z') { throw "Invalid Finding ID" }
+foreach ($value in @($Title, $Severity, $Status, $Confidence, $Location)) {
+    if ($value -match '[\x00-\x1f\x7f]') { throw "Metadata fields must be single-line text" }
+}
+if ($Status -cnotin @('candidate','validated','false_positive','accepted_risk','superseded')) {
+    throw "Unsupported Finding status"
+}
+# Reject links/junctions in all input/output paths below the chosen case root.
+# This preflight does not prevent concurrent path replacement (TOCTOU).
+$paths = @($evidenceDir, $reportDir, (Join-Path $reportDir 'report.md'))
+$paths += @($idList | ForEach-Object { Join-Path $evidenceDir "$_.md" })
+foreach ($candidate in $paths) {
+    $item = Get-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
+    if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Case paths must not contain links or junctions"
+    }
+}
+
 
 foreach ($id in $idList) {
     $evidenceFile = Join-Path $evidenceDir "$id.md"
     if (-not (Test-Path -LiteralPath $evidenceFile)) { Write-Error "Evidence file not found: $evidenceFile" }
 }
+
+if (-not (Test-Path -LiteralPath $reportDir)) { New-Item -ItemType Directory -Path $reportDir | Out-Null }
 
 foreach ($id in $idList) {
     $evidenceFile = Join-Path $evidenceDir "$id.md"

@@ -35,26 +35,47 @@ def main():
     parser.add_argument("--title", required=True)
     parser.add_argument("--description", required=True)
     parser.add_argument("--severity", default="medium")
-    parser.add_argument("--status", default="validated")
+    parser.add_argument("--status", default="candidate")
     parser.add_argument("--confidence", default="medium")
     parser.add_argument("--location", default="see evidence_ids")
     args = parser.parse_args()
 
-    case_root = Path(args.case_root)
+    ids = [i.strip() for i in args.evidence_ids.split(",") if i.strip()]
+    if not ids or len(set(ids)) != len(ids) or any(
+        not re.fullmatch(r"E-[A-Za-z0-9][A-Za-z0-9_-]*", eid) for eid in ids
+    ) or not re.fullmatch(r"F-[A-Za-z0-9][A-Za-z0-9_-]*", args.finding_id):
+        print("Error: invalid or duplicate Evidence/Finding ID", file=sys.stderr)
+        return 1
+    for value in (args.title, args.severity, args.status, args.confidence, args.location):
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            print("Error: metadata fields must be single-line text", file=sys.stderr)
+            return 1
+    if args.status not in {"candidate", "validated", "false_positive", "accepted_risk", "superseded"}:
+        print("Error: unsupported Finding status", file=sys.stderr)
+        return 1
+
+    case_root = Path(args.case_root).resolve()
     evidence_dir = case_root / "evidence"
     report_dir = case_root / "report"
-    report_dir.mkdir(exist_ok=True)
-
-    ids = [i.strip() for i in args.evidence_ids.split(",") if i.strip()]
-    if not ids:
-        print("Error: no Evidence IDs provided", file=sys.stderr)
+    # Validate every input/output before any directory creation or write.
+    # This is not a race-proof boundary for a concurrently writable case directory.
+    try:
+        evidence_dir.resolve().relative_to(case_root)
+        report_dir.resolve().relative_to(case_root)
+        (report_dir / "report.md").resolve().relative_to(report_dir.resolve())
+        for eid in ids:
+            (evidence_dir / f"{eid}.md").resolve().relative_to(evidence_dir.resolve())
+    except (ValueError, RuntimeError):
+        print("Error: case paths escape their expected directories", file=sys.stderr)
         return 1
+
     for eid in ids:
         f = evidence_dir / f"{eid}.md"
         if not f.exists():
             print(f"Error: {f} not found", file=sys.stderr)
             return 1
 
+    report_dir.mkdir(exist_ok=True)
     for eid in ids:
         f = evidence_dir / f"{eid}.md"
         content = f.read_text(encoding="utf-8-sig")

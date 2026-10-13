@@ -17,6 +17,7 @@ repositories {
 
 dependencies {
     compileOnly 'net.portswigger.burp.extensions:montoya-api:2025.5'
+    testImplementation 'net.portswigger.burp.extensions:montoya-api:2025.5'
     implementation 'com.google.code.gson:gson:2.11.0'
     implementation 'org.nanohttpd:nanohttpd:2.3.1'
 }
@@ -32,4 +33,27 @@ jar {
     }
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     archiveFileName = 'burp-mcp-full.jar'
+}
+
+// Java 21 test-only sandbox. No network, process execution or filesystem writes.
+// SecurityManager is deprecated: this is a regression-test boundary, not production isolation.
+tasks.register('safetyRegression', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.burpmcp.SafetyRegressionTest'
+    doFirst {
+        def policy = layout.buildDirectory.file('safety-test.policy').get().asFile
+        def reads = classpath.files.collect { file ->
+            def escaped = (file.canonicalPath.replace('\\', '/') + (file.isDirectory() ? '/-' : '')).replace('"', '\\"')
+            'permission java.io.FilePermission "' + escaped + '", "read";'
+        }.join('\n')
+        policy.text = 'grant {\n' + reads + '\n' +
+            'permission java.util.PropertyPermission "*", "read";\n' +
+            'permission java.lang.RuntimePermission "accessDeclaredMembers";\n' +
+            'permission java.lang.RuntimePermission "getClassLoader";\n' +
+            'permission java.lang.RuntimePermission "modifyThread";\n' +
+            'permission java.lang.reflect.ReflectPermission "suppressAccessChecks";\n};\n'
+        jvmArgs '-Djava.security.manager', '-Djava.security.policy==' + policy.canonicalPath,
+                '-Dtest.requireIsolation=true'
+    }
 }
