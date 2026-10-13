@@ -59,7 +59,7 @@ if (Test-Path $Path -PathType Container) {
 
 $findings = 0
 foreach ($t in $targets) {
-  $lines = Get-Content -Path $t.FullName -Encoding UTF8
+  $lines = @(Get-Content -Path $t.FullName -Encoding UTF8)
   for ($i = 0; $i -lt $lines.Count; $i++) {
     $line = $lines[$i]
     foreach ($p in $patterns) {
