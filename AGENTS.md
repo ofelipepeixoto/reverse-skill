@@ -19,6 +19,13 @@
 2. 歧义时读 `skills/routing.md` 全矩阵（三轴：目标类型 / 用户意图 / 工具链）
 3. 路由规则唯一事实源：`skills/config/routing.json`（改路由只改这里）
 
+## Scope declarations are not independent authorization
+
+`scope.md`, presets and `ready_for_act` record an operator's declaration. They do
+not authenticate the operator, prove ownership, restrict the network, or grant
+permission to a downstream executor. External services must enforce their own
+identity, approval and scope policies independently of these editable files.
+
 ## 授权门禁（硬性）
 
 - 对任何目标动手前，按平台初始化当前分析项目的 `work/<case>/scope.md`：

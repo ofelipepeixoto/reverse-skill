@@ -129,3 +129,15 @@ Promotion to status=validated is stricter (decision cookbook):
 | blocked promotion | record Evidence E-insufficient-evidence |
 
 Full recipes: [nalysis-decision-framework.md](analysis-decision-framework.md) (R4*, R1, R41, R44).
+
+## Consolidation safety boundary
+
+Consolidators now default to `candidate`. An explicit `validated` value remains
+an operator declaration, not authenticated review or evidence of source independence.
+The legacy supersession rewrite remains non-transactional and changes evidence bytes.
+Consumers must not promote it into authorization or reviewer identity.
+
+IDs and single-line metadata are validated before writes. Paths are preflighted,
+but a case directory writable by another process is not a secure storage boundary:
+concurrent replacement, hard links and platform-specific filesystem semantics need
+separate controls. Run only on a trusted, private, non-concurrently modified case.

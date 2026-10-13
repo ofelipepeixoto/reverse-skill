@@ -22,7 +22,8 @@ function Check([bool] $Condition, [string] $Message) {
 Check ($text -match '(?m)^\s+PR_NUMBER:\s*\$\{\{\s*github\.event\.pull_request\.number\s*\}\}') 'PR number is passed through the environment'
 Check ($text -match '(?m)^\s+PR_TITLE:\s*\$\{\{\s*github\.event\.pull_request\.title\s*\}\}') 'PR title is passed through the environment'
 Check ($text -match '(?m)^\s+PR_SUBJECT:\s*\$\{\{\s*format\(') 'PR subject is constructed as environment data'
-Check ($text -match '(?ms)gh pr merge "\$PR_NUMBER".*--subject "\$PR_SUBJECT"') 'merge command quotes the PR number and subject'
+Check ($text -notmatch '(?m)^\s+gh pr (?:merge|comment)\b') 'journal validation cannot mutate or merge PRs'
+Check ($text -notmatch '(?m)^\s+(?:contents|pull-requests):\s*write') 'journal validation has read-only permissions'
 Check ($text -notmatch '(?m)--subject[^\r\n]*github\.event\.pull_request\.title') 'PR title is not interpolated into the merge command'
 Check ($text -notmatch '(?m)gh pr (?:diff|merge|comment)\s+\$\{\{') 'GitHub CLI commands do not embed event expressions'
 

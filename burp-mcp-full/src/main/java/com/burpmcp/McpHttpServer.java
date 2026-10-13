@@ -48,17 +48,24 @@ public class McpHttpServer extends NanoHTTPD {
     private final MontoyaApi api;
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
     private final String authToken;
+    private final SafetyPolicy safetyPolicy;
     private CollaboratorClient collaborator;
     private volatile Audit activeAudit = null;
     private volatile Crawl activeCrawl = null;
 
     public McpHttpServer(MontoyaApi api, int port) {
-        super("127.0.0.1", port);
-        this.api = api;
-        this.authToken = resolveAuthToken();
+        this(api, port, resolveAuthToken(), Boolean.getBoolean("burp.mcp.allowUnrestricted"));
     }
 
-    private String resolveAuthToken() {
+    // Explicit injection keeps tests independent of token files and client credentials.
+    McpHttpServer(MontoyaApi api, int port, String token, boolean allowUnrestricted) {
+        super("127.0.0.1", port);
+        this.api = api;
+        this.authToken = token;
+        this.safetyPolicy = new SafetyPolicy(allowUnrestricted);
+    }
+
+    private static String resolveAuthToken() {
         String token = System.getProperty("burp.mcp.token");
         if (token == null || token.isBlank()) {
             token = System.getenv("BURP_MCP_TOKEN");
@@ -78,7 +85,7 @@ public class McpHttpServer extends NanoHTTPD {
         return token;
     }
 
-    private void writeTokenFile(Path tokenFile, String token) throws IOException {
+    private static void writeTokenFile(Path tokenFile, String token) throws IOException {
         Set<PosixFilePermission> ownerOnly = EnumSet.of(
                 PosixFilePermission.OWNER_READ,
                 PosixFilePermission.OWNER_WRITE);
@@ -120,6 +127,12 @@ public class McpHttpServer extends NanoHTTPD {
         }
     }
 
+    @Override
+    public void stop() {
+        threadPool.shutdownNow();
+        super.stop();
+    }
+
     private boolean isAuthorized(IHTTPSession session) {
         String auth = session.getHeaders().get("authorization");
         return auth != null && auth.equals("Bearer " + authToken);
@@ -150,6 +163,13 @@ public class McpHttpServer extends NanoHTTPD {
             addCorsHeaders(resp); return resp;
         }
         try {
+            String length = session.getHeaders().get("content-length");
+            if (length == null || !length.matches("[0-9]{1,7}")
+                    || Long.parseLong(length) > 1048576
+                    || session.getHeaders().containsKey("transfer-encoding")) {
+                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json",
+                        "{\"error\":\"A bounded Content-Length (max 1 MiB) is required\"}");
+            }
             Map<String, String> bodyMap = new HashMap<>();
             session.parseBody(bodyMap);
             String body = bodyMap.get("postData");
@@ -167,7 +187,16 @@ public class McpHttpServer extends NanoHTTPD {
         }
     }
 
-    private JsonObject dispatch(String tool, JsonObject params) {
+    synchronized JsonObject dispatch(String tool, JsonObject params) {
+        try {
+            safetyPolicy.check(tool, params, url -> api.scope().isInScope(url));
+        } catch (RuntimeException denied) {
+            JsonObject error = new JsonObject();
+            error.addProperty("error", denied instanceof IllegalArgumentException
+                    ? denied.getMessage() : "Policy evaluation failed; request denied");
+            error.addProperty("code", "POLICY_DENIED");
+            return error;
+        }
         switch (tool) {
             case "proxy_history": return proxyHistory(params);
             case "proxy_detail": return proxyDetail(params);
@@ -269,23 +298,23 @@ public class McpHttpServer extends NanoHTTPD {
         String filterMethod = params.has("method_filter") ? params.get("method_filter").getAsString() : null;
         int filterStatus = params.has("status_filter") ? params.get("status_filter").getAsInt() : 0;
 
-        List<ProxyHttpRequestResponse> filtered = new ArrayList<>(history);
+        List<Integer> filtered = java.util.stream.IntStream.range(0, history.size()).boxed().collect(Collectors.toList());
         if (filterUrl != null) {
-            filtered = filtered.stream().filter(r -> r.finalRequest().url().contains(filterUrl)).collect(Collectors.toList());
+            filtered = filtered.stream().filter(i -> history.get(i).finalRequest().url().contains(filterUrl)).collect(Collectors.toList());
         }
         if (filterMethod != null) {
-            filtered = filtered.stream().filter(r -> r.finalRequest().method().equalsIgnoreCase(filterMethod)).collect(Collectors.toList());
+            filtered = filtered.stream().filter(i -> history.get(i).finalRequest().method().equalsIgnoreCase(filterMethod)).collect(Collectors.toList());
         }
         if (filterStatus > 0) {
-            filtered = filtered.stream().filter(r -> r.response() != null && r.response().statusCode() == filterStatus).collect(Collectors.toList());
+            filtered = filtered.stream().filter(i -> history.get(i).response() != null && history.get(i).response().statusCode() == filterStatus).collect(Collectors.toList());
         }
         Collections.reverse(filtered);
         int end = Math.min(offset + limit, filtered.size());
         JsonArray items = new JsonArray();
         for (int i = offset; i < end; i++) {
-            ProxyHttpRequestResponse entry = filtered.get(i);
+            ProxyHttpRequestResponse entry = history.get(filtered.get(i));
             JsonObject item = new JsonObject();
-            item.addProperty("index", i);
+            item.addProperty("index", filtered.get(i));
             item.addProperty("method", entry.finalRequest().method());
             item.addProperty("url", entry.finalRequest().url());
             item.addProperty("status", entry.response() != null ? entry.response().statusCode() : 0);
@@ -318,13 +347,13 @@ public class McpHttpServer extends NanoHTTPD {
                 rawReq.append(entry.getKey()).append(": ").append(entry.getValue().getAsString()).append("\r\n");
             }
             if (!body.isEmpty()) {
-                rawReq.append("Content-Length: ").append(body.length()).append("\r\n\r\n").append(body);
+                rawReq.append("Content-Length: ").append(body.getBytes(StandardCharsets.UTF_8).length).append("\r\n\r\n").append(body);
             } else {
                 rawReq.append("\r\n");
             }
 
             HttpService service = HttpService.httpService(host, port, isHttps);
-            HttpRequest request = HttpRequest.httpRequest(service, rawReq.toString());
+            HttpRequest request = HttpRequest.httpRequest(service, ByteArray.byteArray(rawReq.toString().getBytes(StandardCharsets.UTF_8)));
             HttpResponse response = api.http().sendRequest(request).response();
 
             result.addProperty("status", response.statusCode());
@@ -412,10 +441,10 @@ public class McpHttpServer extends NanoHTTPD {
                     rawReq.append("Host: ").append(host).append("\r\n");
                     for (Map.Entry<String, JsonElement> e : headers.entrySet())
                         rawReq.append(e.getKey()).append(": ").append(e.getValue().getAsString()).append("\r\n");
-                    if (!body.isEmpty()) rawReq.append("Content-Length: ").append(body.length()).append("\r\n\r\n").append(body);
+                    if (!body.isEmpty()) rawReq.append("Content-Length: ").append(body.getBytes(StandardCharsets.UTF_8).length).append("\r\n\r\n").append(body);
                     else rawReq.append("\r\n");
                     HttpService svc = HttpService.httpService(host, port, isHttps);
-                    HttpResponse resp = api.http().sendRequest(HttpRequest.httpRequest(svc, rawReq.toString())).response();
+                    HttpResponse resp = api.http().sendRequest(HttpRequest.httpRequest(svc, ByteArray.byteArray(rawReq.toString().getBytes(StandardCharsets.UTF_8)))).response();
                     count++;
                     boolean isHit = false;
                     if (successLengthNot > 0 && resp.body().length() != successLengthNot) isHit = true;
@@ -448,7 +477,7 @@ public class McpHttpServer extends NanoHTTPD {
             String bodyTemplate = params.has("body_template") ? params.get("body_template").getAsString() : "";
             JsonObject headers = params.has("headers") ? params.getAsJsonObject("headers") : new JsonObject();
             int successLengthNot = params.has("success_length_not") ? params.get("success_length_not").getAsInt() : -1;
-            int threads = params.has("threads") ? params.get("threads").getAsInt() : 50;
+            int threads = params.has("threads") ? params.get("threads").getAsInt() : 20;
 
             ExecutorService executor = Executors.newFixedThreadPool(threads);
             ConcurrentLinkedQueue<JsonObject> hits = new ConcurrentLinkedQueue<>();
@@ -475,10 +504,10 @@ public class McpHttpServer extends NanoHTTPD {
                         rawReq.append("Host: ").append(host).append("\r\n");
                         for (Map.Entry<String, JsonElement> e : headers.entrySet())
                             rawReq.append(e.getKey()).append(": ").append(e.getValue().getAsString()).append("\r\n");
-                        if (!body.isEmpty()) rawReq.append("Content-Length: ").append(body.length()).append("\r\n\r\n").append(body);
+                        if (!body.isEmpty()) rawReq.append("Content-Length: ").append(body.getBytes(StandardCharsets.UTF_8).length).append("\r\n\r\n").append(body);
                         else rawReq.append("\r\n");
                         HttpService svc = HttpService.httpService(host, port, isHttps);
-                        HttpResponse resp = api.http().sendRequest(HttpRequest.httpRequest(svc, rawReq.toString())).response();
+                        HttpResponse resp = api.http().sendRequest(HttpRequest.httpRequest(svc, ByteArray.byteArray(rawReq.toString().getBytes(StandardCharsets.UTF_8)))).response();
                         count.incrementAndGet();
                         if (successLengthNot > 0 && resp.body().length() != successLengthNot) {
                             JsonObject hit = new JsonObject();
@@ -757,10 +786,10 @@ public class McpHttpServer extends NanoHTTPD {
                     rawReq.append("Host: ").append(host).append("\r\n");
                     for (Map.Entry<String, JsonElement> e : headers.entrySet())
                         rawReq.append(e.getKey()).append(": ").append(e.getValue().getAsString()).append("\r\n");
-                    if (!body.isEmpty()) rawReq.append("Content-Length: ").append(body.length()).append("\r\n\r\n").append(body);
+                    if (!body.isEmpty()) rawReq.append("Content-Length: ").append(body.getBytes(StandardCharsets.UTF_8).length).append("\r\n\r\n").append(body);
                     else rawReq.append("\r\n");
                     HttpService svc = HttpService.httpService(host, port, isHttps);
-                    HttpResponse resp = api.http().sendRequest(HttpRequest.httpRequest(svc, rawReq.toString())).response();
+                    HttpResponse resp = api.http().sendRequest(HttpRequest.httpRequest(svc, ByteArray.byteArray(rawReq.toString().getBytes(StandardCharsets.UTF_8)))).response();
                     count++;
                     boolean isHit = false;
                     if (successLengthNot > 0 && resp.body().length() != successLengthNot) isHit = true;
@@ -990,8 +1019,8 @@ public class McpHttpServer extends NanoHTTPD {
                     String path = uri.getRawPath() + (uri.getRawQuery() != null ? "?" + uri.getRawQuery() : ""); boolean isHttps = uri.getScheme().equals("https");
                     StringBuilder rawReq = new StringBuilder(); rawReq.append(method).append(" ").append(path).append(" HTTP/1.1\r\nHost: ").append(host).append("\r\n");
                     for (Map.Entry<String, JsonElement> e : headers.entrySet()) rawReq.append(e.getKey()).append(": ").append(e.getValue().getAsString()).append("\r\n");
-                    if (!body.isEmpty()) rawReq.append("Content-Length: ").append(body.length()).append("\r\n\r\n").append(body); else rawReq.append("\r\n");
-                    HttpResponse resp = api.http().sendRequest(HttpRequest.httpRequest(HttpService.httpService(host, port, isHttps), rawReq.toString())).response();
+                    if (!body.isEmpty()) rawReq.append("Content-Length: ").append(body.getBytes(StandardCharsets.UTF_8).length).append("\r\n\r\n").append(body); else rawReq.append("\r\n");
+                    HttpResponse resp = api.http().sendRequest(HttpRequest.httpRequest(HttpService.httpService(host, port, isHttps), ByteArray.byteArray(rawReq.toString().getBytes(StandardCharsets.UTF_8)))).response();
                     count++;
                     if (successLengthNot > 0 && resp.body().length() != successLengthNot) { JsonObject hit = new JsonObject(); hit.addProperty("iteration", i); hit.addProperty("length", resp.body().length()); hits.add(hit); }
                 } catch (Exception e) { errors++; }
@@ -1173,8 +1202,8 @@ public class McpHttpServer extends NanoHTTPD {
                     String path = uri.getRawPath() + (uri.getRawQuery() != null ? "?" + uri.getRawQuery() : ""); boolean isHttps = uri.getScheme().equals("https");
                     StringBuilder rawReq = new StringBuilder(); rawReq.append(method).append(" ").append(path).append(" HTTP/1.1\r\nHost: ").append(host).append("\r\n");
                     for (Map.Entry<String, JsonElement> e : headers.entrySet()) rawReq.append(e.getKey()).append(": ").append(e.getValue().getAsString()).append("\r\n");
-                    if (!body.isEmpty()) rawReq.append("Content-Length: ").append(body.length()).append("\r\n\r\n").append(body); else rawReq.append("\r\n");
-                    HttpResponse resp = api.http().sendRequest(HttpRequest.httpRequest(HttpService.httpService(host, port, isHttps), rawReq.toString())).response();
+                    if (!body.isEmpty()) rawReq.append("Content-Length: ").append(body.getBytes(StandardCharsets.UTF_8).length).append("\r\n\r\n").append(body); else rawReq.append("\r\n");
+                    HttpResponse resp = api.http().sendRequest(HttpRequest.httpRequest(HttpService.httpService(host, port, isHttps), ByteArray.byteArray(rawReq.toString().getBytes(StandardCharsets.UTF_8)))).response();
                     count++;
                     if (successLengthNot > 0 && resp.body().length() != successLengthNot) { JsonObject hit = new JsonObject(); hit.addProperty("payload", payloadDesc.toString()); hit.addProperty("status", resp.statusCode()); hit.addProperty("length", resp.body().length()); hits.add(hit); }
                 } catch (Exception e) { errors++; count++; }
@@ -1209,8 +1238,8 @@ public class McpHttpServer extends NanoHTTPD {
                     String path = uri.getRawPath() + (uri.getRawQuery() != null ? "?" + uri.getRawQuery() : ""); boolean isHttps = uri.getScheme().equals("https");
                     StringBuilder rawReq = new StringBuilder(); rawReq.append(method).append(" ").append(path).append(" HTTP/1.1\r\nHost: ").append(host).append("\r\n");
                     for (Map.Entry<String, JsonElement> e : headers.entrySet()) rawReq.append(e.getKey()).append(": ").append(e.getValue().getAsString().replace(placeholder, payload)).append("\r\n");
-                    if (!body.isEmpty()) rawReq.append("Content-Length: ").append(body.length()).append("\r\n\r\n").append(body); else rawReq.append("\r\n");
-                    HttpResponse resp = api.http().sendRequest(HttpRequest.httpRequest(HttpService.httpService(host, port, isHttps), rawReq.toString())).response();
+                    if (!body.isEmpty()) rawReq.append("Content-Length: ").append(body.getBytes(StandardCharsets.UTF_8).length).append("\r\n\r\n").append(body); else rawReq.append("\r\n");
+                    HttpResponse resp = api.http().sendRequest(HttpRequest.httpRequest(HttpService.httpService(host, port, isHttps), ByteArray.byteArray(rawReq.toString().getBytes(StandardCharsets.UTF_8)))).response();
                     count++;
                     if (successLengthNot > 0 && resp.body().length() != successLengthNot) { JsonObject hit = new JsonObject(); hit.addProperty("payload", payload); hit.addProperty("status", resp.statusCode()); hit.addProperty("length", resp.body().length()); hits.add(hit); }
                 } catch (Exception e2) { errors++; }
@@ -1255,7 +1284,7 @@ public class McpHttpServer extends NanoHTTPD {
                     for (Map.Entry<String, JsonElement> e : headers.entrySet()) rawReq.append(e.getKey()).append(": ").append(e.getValue().getAsString()).append("\r\n");
                     rawReq.append("\r\n");
                     long startMs = System.currentTimeMillis();
-                    HttpResponse resp = api.http().sendRequest(HttpRequest.httpRequest(HttpService.httpService(host, port, isHttps), rawReq.toString())).response();
+                    HttpResponse resp = api.http().sendRequest(HttpRequest.httpRequest(HttpService.httpService(host, port, isHttps), ByteArray.byteArray(rawReq.toString().getBytes(StandardCharsets.UTF_8)))).response();
                     long elapsed = System.currentTimeMillis() - startMs;
                     count++;
                     boolean isHit = (successLengthNot > 0 && resp.body().length() != successLengthNot);
@@ -1541,8 +1570,6 @@ public class McpHttpServer extends NanoHTTPD {
     private final java.util.Map<String, ExtensionWebSocket> wsConnections = new java.util.concurrent.ConcurrentHashMap();
     private int wsCounter = 0;
     private volatile Registration sessionActionRegistration = null;
-    private boolean scopeGateEnabled = false;
-    private boolean privacyStrict = false;
     private java.util.ArrayList<String> auditLogEntries = new java.util.ArrayList();
     private java.util.concurrent.ExecutorService threadPool = java.util.concurrent.Executors.newFixedThreadPool(20);
 
@@ -1553,8 +1580,8 @@ public class McpHttpServer extends NanoHTTPD {
             HttpService s=HttpService.httpService(u.getHost(), u.getPort()>0?u.getPort():(h?443:80), h);
             String p=(u.getPath()==null||u.getPath().isEmpty())?"/":u.getPath(); String pq=u.getQuery()!=null?p+"?"+u.getQuery():p;
             String r=method+" "+pq+" HTTP/1.1\r\nHost: "+u.getHost()+"\r\nConnection: close\r\n\r\n";
-            if(body!=null&&!body.isEmpty()) r=method+" "+pq+" HTTP/1.1\r\nHost: "+u.getHost()+"\r\nContent-Length: "+body.length()+"\r\nConnection: close\r\n\r\n"+body;
-            return api.http().sendRequest(HttpRequest.httpRequest(s, r));
+            if(body!=null&&!body.isEmpty()) r=method+" "+pq+" HTTP/1.1\r\nHost: "+u.getHost()+"\r\nContent-Length: "+body.getBytes(StandardCharsets.UTF_8).length+"\r\nConnection: close\r\n\r\n"+body;
+            return api.http().sendRequest(HttpRequest.httpRequest(s, ByteArray.byteArray(r.getBytes(StandardCharsets.UTF_8))));
         } catch(Exception ex) { return null; }
     }
 
@@ -1671,12 +1698,30 @@ public class McpHttpServer extends NanoHTTPD {
         }catch(Exception e){r.addProperty("error",e.getMessage());} return r; }
 
     // === PHASE 3-4 ===
-    private JsonObject scopeGate(JsonObject p) { JsonObject r=new JsonObject();
-        String a=p.has("action")?p.get("action").getAsString():""; if("enable".equals(a)){scopeGateEnabled=true;addAuditLog("scope:enabled");r.addProperty("scope_gate",true);}
-        else if("disable".equals(a)){scopeGateEnabled=false;addAuditLog("scope:disabled");r.addProperty("scope_gate",false);} else r.addProperty("scope_gate",scopeGateEnabled); return r; }
-    private JsonObject privacyMode(JsonObject p) { JsonObject r=new JsonObject();
-        String m=p.has("mode")?p.get("mode").getAsString():""; if("strict".equals(m)){privacyStrict=true;addAuditLog("privacy:strict");r.addProperty("privacy","strict");}
-        else if("off".equals(m)){privacyStrict=false;addAuditLog("privacy:off");r.addProperty("privacy","off");} else r.addProperty("privacy",privacyStrict?"strict":"off"); return r; }
+    private JsonObject scopeGate(JsonObject p) {
+        JsonObject result = new JsonObject();
+        String action = p.has("action") ? p.get("action").getAsString() : "";
+        try {
+            if ("enable".equals(action) || "disable".equals(action)) {
+                safetyPolicy.scope("enable".equals(action));
+                addAuditLog("scope:" + safetyPolicy.scopeEnabled());
+            } else if (!action.isEmpty()) throw new IllegalArgumentException("Invalid scope action");
+            result.addProperty("scope_gate", safetyPolicy.scopeEnabled());
+        } catch (IllegalArgumentException ex) { result.addProperty("error", ex.getMessage()); }
+        return result;
+    }
+    private JsonObject privacyMode(JsonObject p) {
+        JsonObject result = new JsonObject();
+        String mode = p.has("mode") ? p.get("mode").getAsString() : "";
+        try {
+            if ("strict".equals(mode) || "off".equals(mode)) {
+                safetyPolicy.privacy("strict".equals(mode));
+                addAuditLog("privacy:" + safetyPolicy.privacyStrict());
+            } else if (!mode.isEmpty()) throw new IllegalArgumentException("Invalid privacy mode");
+            result.addProperty("privacy", safetyPolicy.privacyStrict() ? "strict" : "off");
+        } catch (IllegalArgumentException ex) { result.addProperty("error", ex.getMessage()); }
+        return result;
+    }
     private JsonObject auditLog(JsonObject p) { JsonObject r=new JsonObject();
         int lim=p.has("limit")?p.get("limit").getAsInt():50; var items=new JsonArray();
         int start=Math.max(0,auditLogEntries.size()-lim); for(int i=start;i<auditLogEntries.size();i++) items.add((String)auditLogEntries.get(i));

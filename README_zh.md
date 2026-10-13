@@ -72,7 +72,7 @@
 
 | 路由规则 | 回归基准 | 核心 Skill | CI 平台 | 客户端模型 |
 |---:|---:|---:|---|---|
-| 44 条（R0–R45） | 175 条用例 | 45 个已跟踪模块 | Windows + Ubuntu | 平台无关 |
+| 44 条（R0–R45） | 178 条用例 | 45 个已跟踪模块 | Windows + Ubuntu | 平台无关 |
 
 路由核心由单一结构化配置驱动，通过跨平台 CI 验证，并与各客户端的可选适配层保持分离。
 
@@ -216,7 +216,7 @@ git clone https://github.com/zhaoxuya520/reverse-skill.git
 | [skills/scripts/master-route.ps1](skills/scripts/master-route.ps1) | 一键分诊 |
 | [skills/scripts/case-init.ps1](skills/scripts/case-init.ps1) | 作战 case 目录（scope/timeline） |
 | [skills/case-review/](skills/case-review/) | 只读 Evidence 图审查与 artifact fixity 校验 |
-| [skills/scripts/test-routing.ps1](skills/scripts/test-routing.ps1) | 175 条路由回归基准 |
+| [skills/scripts/test-routing.ps1](skills/scripts/test-routing.ps1) | 178 条路由回归基准 |
 | [skills/scripts/verify-routing-coherence.ps1](skills/scripts/verify-routing-coherence.ps1) | 结构一致性与供应链版本固定门禁 |
 | [skills/ops/](skills/ops/) | Scope / 证据链 / 角色 / 时间线 / skill 供应链安全 |
 | [skills/references/community-security-skills.md](skills/references/community-security-skills.md) | 社区安全 skill 生态对照（借鉴不并库） |
@@ -224,7 +224,7 @@ git clone https://github.com/zhaoxuya520/reverse-skill.git
 ### 修改后验证
 
 ```powershell
-# 路由回归（175 条）
+# 路由回归（178 条）
 powershell -NoProfile -ExecutionPolicy Bypass -File skills/scripts/test-routing.ps1
 # 结构一致性 + 供应链版本固定门禁
 powershell -NoProfile -ExecutionPolicy Bypass -File skills/scripts/verify-routing-coherence.ps1
